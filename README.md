@@ -88,11 +88,11 @@ apk --update-cache add curl grep sed ip-full gawk tcpdump-mini jq
 *   `thresholdBytes`: Минимальный ожидаемый размер файла в байтах. Если скачано меньше — считается ошибкой или блокировкой (полезно для отлова заглушек провайдера "Access Denied").
 *   `times`: (Опционально) Сколько раз повторить тест для этого URL (по умолчанию 1).
 
+---
+
 # Пример использования:
 
 ![Screenshot #1](/usage_example.png?raw=true)
-
----
 
 ---
 
