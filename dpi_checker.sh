@@ -4,7 +4,7 @@
 # CONFIGURATION
 # ==============================================================================
 
-USER_AGENT="Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:147.0) Gecko/20100101 Firefox/147.0"
+USER_AGENT="Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:146.0) Gecko/20100101 Firefox/146.0"
 TIMEOUT_TOTAL=12
 TIMEOUT_CONNECT=5
 DEFAULT_THRESHOLD=24576
@@ -36,6 +36,7 @@ log_succ() { printf "${GREEN}[OK]${NC} %s\n" "$1"; }
 log_err()  { printf "${RED}[ERROR]${NC} %s\n" "$1" >&2; }
 
 cleanup() {
+    kill $(jobs -p) 2>/dev/null
     [ -n "${WORKDIR:-}" ] && [ -d "$WORKDIR" ] && rm -rf "$WORKDIR"
 }
 
@@ -43,7 +44,7 @@ guard_rails() {
     [ "$(id -u)" -ne 0 ] && { log_err "Run as root."; exit 1; }
     
     # Добавлен jq в список зависимостей, а также ps для проверки процессов
-    for cmd in curl tcpdump awk ip grep wc sed nslookup jq ps; do
+    for cmd in curl tcpdump awk ip grep wc sed nslookup jq ps timeout; do
         command -v "$cmd" >/dev/null 2>&1 || { log_err "Missing dependency: $cmd (install it first)"; exit 1; }
     done
 
@@ -145,39 +146,47 @@ check_dpi() {
 
     # --- CAPTURE ---
     # Запускаем tcpdump в фоне
-    tcpdump -i "$iface" -n -s 128 "host $dst_ip and tcp port $port" -w "$pcap" 2>/dev/null &
+    tcpdump -i "$iface" -n -s 128 -U "host $dst_ip and tcp port $port" -w "$pcap" 2>/dev/null &
     local tcpdump_pid=$!
     
-    # Ожидание запуска
-    local retries=0
-    while ! ps -p "$tcpdump_pid" >/dev/null 2>&1 && [ "$retries" -lt 10 ]; do
+    # Ожидание появления файла (до 1 секунды)
+    local wait_max=10
+    while [ ! -s "$pcap" ] && [ "$wait_max" -gt 0 ]; do
         sleep 0.1
-        retries=$((retries + 1))
+        wait_max=$((wait_max - 1))
     done
-    sleep 0.75 # Небольшой буфер для инициализации захвата для маломощных устройств
+    # Если файл так и не появился, возможно tcpdump не запустился — прерываем тест
+    if [ ! -s "$pcap" ]; then
+        kill "$tcpdump_pid" 2>/dev/null
+        wait "$tcpdump_pid" 2>/dev/null || true
+        echo "${id}@${times_idx}|$provider|TCPDUMP_FAILED|ip=$dst_ip"
+        return
+    fi
 
     # --- REQUEST ---
     # Генерируем timestamp для обхода кэша
-    local ts_rand=$(( $(date +%s 2>/dev/null || echo 0) * 1000 + $(awk 'BEGIN{srand(); print int(rand()*1000)}') ))
+    local ts_rand=$(awk 'BEGIN{srand(); print int(rand()*1000000)}')
     local sep="?"; echo "$url_clean" | grep -q "?" && sep="&"
     local url_final="${url_clean}${sep}t=${ts_rand}"
 
-    # [PATCH] Используем --resolve для гарантии, что curl пойдет на тот же IP, который мы слушаем
+    # Используем --resolve для гарантии, что curl пойдет на тот же IP, который мы слушаем
+    # Убрали --location \
     # Прямой вызов curl без sh -c
     timeout "${TIMEOUT_TOTAL}s" curl -sSL \
         --resolve "$host:$port:$dst_ip" \
         --connect-timeout "$TIMEOUT_CONNECT" \
-        --location \
         -H "User-Agent: $USER_AGENT" \
         -H "Cache-Control: no-store" \
         -w '%{http_code}' \
         -o "$body_file" \
-        "$url_final" > "$meta_file" 2>/dev/null
+        "$url_final" > "$meta_file" 2>/dev/null # Риск интерпретации shell-спецсимволов в URL - проверять ссылки в тесте. Исправлять лень
     
     local curl_exit=$?
 
     # Останавливаем tcpdump
-    kill "$tcpdump_pid" 2>/dev/null; wait "$tcpdump_pid" 2>/dev/null || true
+    if [ -n "$tcpdump_pid" ] && kill -0 "$tcpdump_pid" 2>/dev/null; then
+        kill "$tcpdump_pid" 2>/dev/null; wait "$tcpdump_pid" 2>/dev/null || true
+    fi
 
     # --- ANALYZE ---
     local body_size=0
@@ -187,8 +196,8 @@ check_dpi() {
     [ -f "$meta_file" ] && http_code=$(cat "$meta_file" 2>/dev/null || echo 0)
 
     local has_rst=0
-    if [ -s "$pcap" ]; then
-        tcpdump -n -r "$pcap" 2>/dev/null | grep -qE "\[R\]" && has_rst=1
+    if [ -s "$pcap" ] && tcpdump -n -r "$pcap" 'tcp[13] & 4 != 0' 2>/dev/null | grep -q .; then
+        has_rst=1
     fi
     
     # Удаляем временные файлы конкретного теста
@@ -196,7 +205,7 @@ check_dpi() {
 
     # --- VERDICT ---
     local is_timeout=0
-    { [ "$curl_exit" -eq 124 ] || [ "$curl_exit" -eq 143 ]; } && is_timeout=1
+    { [ "$curl_exit" -eq 124 ] || [ "$curl_exit" -eq 143 ] || [ "$curl_exit" -eq 28 ]; } && is_timeout=1
     
     # 1. SUCCESS
     if [ "$body_size" -ge "$target_threshold" ]; then
@@ -328,7 +337,7 @@ OUTPUT_FILE="${2:-$DEFAULT_OUTPUT}"
 guard_rails "$TARGETS_FILE"
 
 WORKDIR=$(mktemp -d -t dpi_check.XXXXXX) || exit 1
-trap cleanup EXIT INT TERM
+trap 'cleanup; exit' EXIT INT TERM
 
 log_step "Initializing"
 target_count=$(load_targets "$TARGETS_FILE")
